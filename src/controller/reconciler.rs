@@ -42,7 +42,10 @@ pub async fn run_controller(state: Arc<ControllerState>) -> Result<()> {
     match stellar_nodes.list(&Default::default()).await {
         Ok(_) => info!("StellarNode CRD is available"),
         Err(e) => {
-            error!("StellarNode CRD not found. Please install the CRD first: {:?}", e);
+            error!(
+                "StellarNode CRD not found. Please install the CRD first: {:?}",
+                e
+            );
             return Err(Error::ConfigError(
                 "StellarNode CRD not installed".to_string(),
             ));
@@ -99,6 +102,7 @@ async fn reconcile(obj: Arc<StellarNode>, ctx: Arc<ControllerState>) -> Result<A
 }
 
 /// Apply/create/update the StellarNode resources
+/// Apply/create/update the StellarNode resources
 async fn apply_stellar_node(client: &Client, node: &StellarNode) -> Result<Action> {
     let namespace = node.namespace().unwrap_or_else(|| "default".to_string());
     let name = node.name_any();
@@ -112,33 +116,53 @@ async fn apply_stellar_node(client: &Client, node: &StellarNode) -> Result<Actio
         return Err(Error::ValidationError(e));
     }
 
-    // Check if suspended
-    if node.spec.suspended {
-        info!("Node {}/{} is suspended, scaling to 0", namespace, name);
-        update_status(client, node, "Suspended", Some("Node is suspended")).await?;
-        // Still create resources but with 0 replicas
-    }
-
-    // Update status to Creating
-    update_status(client, node, "Creating", Some("Creating resources")).await?;
-
-    // 1. Create/update the PersistentVolumeClaim
+    // 1. Create/update the PersistentVolumeClaim (Always keep this)
     resources::ensure_pvc(client, node).await?;
     info!("PVC ensured for {}/{}", namespace, name);
 
-    // 2. Create/update the ConfigMap for node configuration
+    // 2. Create/update the ConfigMap (Always keep this)
     resources::ensure_config_map(client, node).await?;
     info!("ConfigMap ensured for {}/{}", namespace, name);
 
+    // --- NEW: Maintenance Mode Logic ---
+    // This satisfies the criteria: "skip 'Apply' steps for the workload"
+    if node.spec.maintenance_mode {
+        info!(
+            "Node {}/{} is in Maintenance Mode. Skipping workload updates.",
+            namespace, name
+        );
+
+        // We still ensure the Service exists as per criteria
+        resources::ensure_service(client, node).await?;
+
+        // Update status so users know why it's not updating
+        update_status(
+            client,
+            node,
+            "Maintenance",
+            Some("Manual maintenance mode active"),
+        )
+        .await?;
+
+        // Return early to skip Step 3 (the workload)
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    }
+    // --- End Maintenance Mode Logic ---
+
+    // Check if suspended (This is existing logic)
+    if node.spec.suspended {
+        info!("Node {}/{} is suspended, scaling to 0", namespace, name);
+        update_status(client, node, "Suspended", Some("Node is suspended")).await?;
+    }
+
     // 3. Create/update the Deployment/StatefulSet based on node type
+    // This part is now SKIPPED if maintenance_mode is true because of the return above
     match node.spec.node_type {
         NodeType::Validator => {
-            // Validators use StatefulSet for stable identity
             resources::ensure_statefulset(client, node).await?;
             info!("StatefulSet ensured for validator {}/{}", namespace, name);
         }
         NodeType::Horizon | NodeType::SorobanRpc => {
-            // RPC nodes use Deployment for easy scaling
             resources::ensure_deployment(client, node).await?;
             info!("Deployment ensured for RPC node {}/{}", namespace, name);
         }
@@ -149,7 +173,11 @@ async fn apply_stellar_node(client: &Client, node: &StellarNode) -> Result<Actio
     info!("Service ensured for {}/{}", namespace, name);
 
     // 5. Update status to Running
-    let phase = if node.spec.suspended { "Suspended" } else { "Running" };
+    let phase = if node.spec.suspended {
+        "Suspended"
+    } else {
+        "Running"
+    };
     update_status(client, node, phase, Some("Resources created successfully")).await?;
 
     // Requeue after 30 seconds to check node health and sync status
@@ -216,7 +244,11 @@ async fn update_status(
         phase: phase.to_string(),
         message: message.map(String::from),
         observed_generation: node.metadata.generation,
-        replicas: if node.spec.suspended { 0 } else { node.spec.replicas },
+        replicas: if node.spec.suspended {
+            0
+        } else {
+            node.spec.replicas
+        },
         ..Default::default()
     };
 
@@ -234,11 +266,7 @@ async fn update_status(
 
 /// Error policy determines how to handle reconciliation errors
 fn error_policy(node: Arc<StellarNode>, error: &Error, _ctx: Arc<ControllerState>) -> Action {
-    error!(
-        "Reconciliation error for {}: {:?}",
-        node.name_any(),
-        error
-    );
+    error!("Reconciliation error for {}: {:?}", node.name_any(), error);
 
     // Use shorter retry for retriable errors
     let retry_duration = if error.is_retriable() {

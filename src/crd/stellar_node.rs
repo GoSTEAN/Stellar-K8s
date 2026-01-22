@@ -98,6 +98,9 @@ pub struct StellarNodeSpec {
     /// Suspend the node (scale to 0 without deleting resources)
     #[serde(default)]
     pub suspended: bool,
+
+    #[serde(default)]
+    pub maintenance_mode: bool,
 }
 
 fn default_replicas() -> i32 {
