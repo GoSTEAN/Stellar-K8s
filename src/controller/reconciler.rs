@@ -22,6 +22,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 
 use futures::StreamExt;
@@ -52,6 +53,7 @@ use super::archive_health::{
 use super::conditions;
 use super::cve_reconciler;
 use super::dr;
+use super::dr_drill;
 use super::finalizers::STELLAR_NODE_FINALIZER;
 use super::health;
 use super::kms_secret;
@@ -1031,7 +1033,23 @@ pub(crate) async fn apply_stellar_node(
     }
 
     // 8. Disaster Recovery reconciliation
-    if let Some(dr_status) = dr::reconcile_dr(client, node).await? {
+    if let Some(mut dr_status) = dr::reconcile_dr(client, node).await? {
+        // 8a. Check if DR drill should be executed
+        if let Some(drill_config) = &node.spec.dr_config.as_ref().and_then(|c| c.drill_schedule.clone()) {
+            if dr_drill::should_run_drill(node, drill_config) {
+                match dr_drill::execute_dr_drill(client, node, drill_config, &dr_status).await {
+                    Ok(drill_result) => {
+                        dr_status.last_drill_time = Some(Utc::now().to_rfc3339());
+                        dr_status.last_drill_result = Some(drill_result);
+                        info!("DR drill completed for {}", node.name_any());
+                    }
+                    Err(e) => {
+                        warn!("DR drill failed for {}: {}", node.name_any(), e);
+                    }
+                }
+            }
+        }
+
         apply_or_emit(ctx, node, ActionType::Update, "Status (DR)", async {
             update_dr_status(client, node, dr_status).await?;
             Ok(())
